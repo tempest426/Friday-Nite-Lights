@@ -69,7 +69,9 @@ final class HalftimeShowEngine: ObservableObject {
     
     private func startMarchingDotsAnimation() {
         stopMarchingDotsAnimation()
+        // Clearing is buffer-only now, so each intended blank screen is committed.
         graphicsEngine.clear(color: 12) // light green field background
+        graphicsEngine.commitFrame()
 
         audioScoreTask = Task.detached(priority: .userInitiated) { [weak self] in
             while !Task.isCancelled {
@@ -85,12 +87,14 @@ final class HalftimeShowEngine: ObservableObject {
         // 2. Animation Task
         showAnimationTask = Task { @MainActor in
             graphicsEngine.clear(color: 12) // light green field background
+            graphicsEngine.commitFrame()
             
             while !Task.isCancelled && stage == .dotsShow {
                 await runAct1_SpiralDrill()
                 guard !Task.isCancelled && stage == .dotsShow else { break }
                 
                 graphicsEngine.clear(color: 12) // light green field background
+                graphicsEngine.commitFrame()
             }
         }
     }
@@ -112,7 +116,7 @@ final class HalftimeShowEngine: ObservableObject {
         for d in dots {
             graphicsEngine.setPixel(x: Int(d.x.rounded()), y: Int(d.y.rounded()), color: d.color)
         }
-        graphicsEngine.presentFrame()
+        graphicsEngine.commitFrame()
     }
 
     private func interpolate(_ a:[BandDot], _ b:[BandDot], t:Double) -> [BandDot] {
@@ -225,6 +229,7 @@ final class HalftimeShowEngine: ObservableObject {
         for i in 0..<exit.count { exit[i].x = i<72 ? 4.0*scaleX : 76.0*scaleX }
         await animate(to: exit, from: &band, frames:60, delay:83_000_000)
         graphicsEngine.clear(color:12) // light green field background
+        graphicsEngine.commitFrame()
     }
 
     deinit {

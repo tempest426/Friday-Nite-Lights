@@ -2,17 +2,73 @@ import Foundation
 import SwiftUI
 import AppKit
 
+/// The result of a kick play, fully decided by the game engine.
+///
+/// The graphics engine animates whatever this describes: it never rolls for a make or a
+/// miss, never picks a landing spot and never decides who takes over. Keeping the result
+/// here means game balance stays in the game engine and the animation is a function of
+/// the outcome plus cosmetic randomness (apex height, drift, the roll after landing).
+enum KickOutcome: Equatable {
+    /// Field goal attempt, and how it resolved.
+    case fieldGoal(FieldGoalResult)
+    
+    /// Punt that came down in the field of play, or went into the end zone as a touchback.
+    /// `spotYardLine` is where the ball is placed (absolute 0...100); for a touchback that
+    /// is the receiving team's own 20, while the ball is drawn flying into the end zone.
+    case punt(spotYardLine: Int, isTouchback: Bool)
+    
+    /// Kickoff, with the same landing semantics as a punt.
+    case kickoff(spotYardLine: Int, isTouchback: Bool)
+    
+    enum FieldGoalResult: Equatable {
+        case good
+        case wideLeft
+        case wideRight
+        case short
+    }
+    
+    /// Where the ball is spotted after a punt or kickoff (nil for a field goal).
+    var spotYardLine: Int? {
+        switch self {
+        case .punt(let spot, _), .kickoff(let spot, _): return spot
+        case .fieldGoal: return nil
+        }
+    }
+    
+    /// True when a punt or kickoff went into the end zone.
+    var isTouchback: Bool {
+        switch self {
+        case .punt(_, let touchback), .kickoff(_, let touchback): return touchback
+        case .fieldGoal: return false
+        }
+    }
+}
+
+/// Apple II low-resolution rasteriser (160×96, indexed 16-colour palette).
+///
+/// Frame contract: every drawing method (`clear`, `setPixel`, `drawField` and the
+/// animations' frame renderers) only mutates `pixelBuffer`. Nothing becomes a visible
+/// frame until `commitFrame()` is called, so a caller that draws several primitives
+/// composes the whole frame first and commits once.
 @MainActor
 class AppleIIGraphicsEngine: ObservableObject {
     static let width = 160
     static let height = 96
     static let totalPixels = width * height
     
-    // Output image for SwiftUI view (zero-cost UI redrawing)
-    @Published var currentFrame: CGImage?
+    /// The playing field is 112 px wide between the goal lines, and that width spans
+    /// 100 yards. Every yard-based offset (ball carrier, kick travel) converts at this
+    /// rate, so callers can pass yards and get pixels that line up with the field.
+    private static let fieldWidthPixels = 112.0
+    private static let pxPerYard = fieldWidthPixels / 100.0
     
-    // Raw pixel buffer
-    public var pixelBuffer = [UInt8](repeating: 0, count: totalPixels)
+    // Output image for SwiftUI view (zero-cost UI redrawing). Written only by
+    // commitFrame(), so views can never publish a frame the engine didn't build.
+    @Published private(set) var currentFrame: CGImage?
+    
+    // Raw pixel buffer. Readable by collaborators, mutable only through the drawing
+    // API; direct writes would bypass commitFrame() and leave the UI stale.
+    private(set) var pixelBuffer = [UInt8](repeating: 0, count: totalPixels)
     
     // Pre-baked static field background buffer
     private var staticFieldBuffer = [UInt8](repeating: 0, count: totalPixels)
@@ -63,9 +119,39 @@ class AppleIIGraphicsEngine: ObservableObject {
     
     // MARK: - Fast CGImage Renderer
     
-    /// Forces a update of the Published CGImage frame to refresh the UI
-    func presentFrame() {
+    /// Converts the current pixel buffer into a CGImage and publishes it to the UI.
+    /// This is the only way a drawn frame reaches the screen.
+    func commitFrame() {
         updateFrameImage()
+    }
+    
+    // MARK: - Animation Lifetime
+    
+    /// Identifies the newest animation. A loop that finds it has been superseded stops
+    /// writing frames, so two animations can never interleave on the same buffer.
+    private var animationGeneration = 0
+    
+    /// Marks the start of a new animation, superseding any older one.
+    private func beginAnimation() -> Int {
+        animationGeneration &+= 1
+        return animationGeneration
+    }
+    
+    /// True while `generation` is still the animation allowed to draw.
+    private func isCurrent(_ generation: Int) -> Bool {
+        generation == animationGeneration && !Task.isCancelled
+    }
+    
+    /// Sleeps on the main actor, reporting whether the animation may continue. A cancelled
+    /// task throws out of `Task.sleep` immediately, so cancellation unwinds the animation
+    /// instead of being swallowed and played to the end.
+    private func pause(nanoseconds: UInt64) async -> Bool {
+        do {
+            try await Task.sleep(nanoseconds: nanoseconds)
+        } catch {
+            return false
+        }
+        return !Task.isCancelled
     }
     
     /// Converts raw Apple II palette buffer to CGImage in microsecond time
@@ -277,31 +363,37 @@ class AppleIIGraphicsEngine: ObservableObject {
                 }
             }
         }
-        
-        updateFrameImage()
     }
     
     // MARK: - Jumbotron Startup Animation Sequence
 
-    func playStartupAnimation(onComplete: @escaping () -> Void) async {
+    /// Animates the jumbotron splash in from the centre of the screen.
+    /// - Returns: true if the animation played to the end; false if it was cancelled or
+    ///   superseded by a newer animation.
+    @discardableResult
+    func playStartupAnimation() async -> Bool {
+        let generation = beginAnimation()
         let splashBuffer = getOrLoadSplashBuffer()
         
         clear(color: 0)
-        updateFrameImage()
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        commitFrame()
+        guard await pause(nanoseconds: 100_000_000) else { return false }
         
         let totalFrames = 20
         for frame in 1...totalFrames {
+            guard isCurrent(generation) else { return false }
             let progress = Double(frame) / Double(totalFrames)
             let easeOutProgress = 1.0 - pow(1.0 - progress, 2)
             let currentScale = 0.05 + (0.95 * easeOutProgress)
             
             drawScaledSplash(scale: currentScale, sourceBuffer: splashBuffer)
-            try? await Task.sleep(nanoseconds: 20_000_000)
+            commitFrame()
+            guard await pause(nanoseconds: 20_000_000) else { return false }
         }
         
         drawScaledSplash(scale: 1.0, sourceBuffer: splashBuffer)
-        onComplete()
+        commitFrame()
+        return true
     }
     
     // MARK: - Intro Splash
@@ -326,8 +418,6 @@ class AppleIIGraphicsEngine: ObservableObject {
                 buf[rowOffset + width - 1] = 12
             }
         }
-        
-        updateFrameImage()
     }
     
     // MARK: - Kick / Punt / Kickoff / Field Goal Animation (top-down view)
@@ -343,105 +433,115 @@ class AppleIIGraphicsEngine: ObservableObject {
     private static let goalCrossbarHeight = 4.0
     private static let goalUprightHeight = 16.0
 
-    /// Plays a top-down kick animation (punt, kickoff or field goal).
+    /// Animates a kick play that the game engine has already resolved.
+    ///
+    /// The engine only draws: whether the kick is good, wide, short, where it lands and
+    /// who takes over are game decisions, handed in as `outcome`. This method turns that
+    /// result into a trajectory and plays it; only the cosmetic side of the flight (hang
+    /// time, apex, lateral drift, the roll after the ball comes down) is decided here.
     ///
     /// The field is viewed from above, so screen X is downfield, screen Y is lateral,
     /// and altitude is shown by drawing a shadow on the ground track and lifting the
     /// ball sprite straight up the screen by its height.
     ///
     /// - Parameters:
+    ///   - outcome: what happened on the kick, including how a miss missed.
     ///   - startYardLine: Kicker's yard line (0–100, same scale as `drawField`)
-    ///   - isFieldGoal: true = field goal attempt, kicked through the posts at the back of the end zone
     ///   - direction: +1 (kicking toward yard 100) or -1 (kicking toward yard 0)
-    ///   - isKickoff: true = kickoff distance/hang time instead of a punt (ignored for field goals)
-    ///   - onComplete: `isGood` is only ever true for a made field goal. `finalYardLine` is the
-    ///     spot where the ball ended up (0–100). A punt or kickoff that ends in the end zone is a
-    ///     touchback and reports the receiving team's own 20 (80 when kicking toward 100, 20 when
-    ///     kicking toward 0).
-    func playKickAnimation(
+    /// - Returns: true if the animation played to the end; false if it was cancelled or
+    ///   superseded by a newer animation, in which case the caller must not act on it.
+    @discardableResult
+    func playKick(
+        _ outcome: KickOutcome,
         startYardLine: Int,
-        isFieldGoal: Bool,
-        direction: Int,
-        isKickoff: Bool = false,
-        onComplete: @escaping (_ isGood: Bool, _ finalYardLine: Int) -> Void
-    ) async {
+        direction: Int
+    ) async -> Bool {
+        let generation = beginAnimation()
         let dir = direction >= 0 ? 1 : -1
         let dirD = Double(dir)
         let fieldStartX = 24.0
-        let fieldWidthPixels = 112.0
-        let pxPerYard = fieldWidthPixels / 100.0
+        let pxPerYard = AppleIIGraphicsEngine.pxPerYard
         let centerLat = AppleIIGraphicsEngine.kickCenterLat
         let halfGap = AppleIIGraphicsEngine.goalHalfGap
-        let crossbarClearance = AppleIIGraphicsEngine.goalCrossbarHeight   // min ball height to clear the bar
-        // Field goals are kicked to the posts at the back of the end zone, expressed in yards.
+        let startX = fieldStartX + Double(startYardLine) * pxPerYard
+        // Posts stand at the back of each end zone, expressed in yards downfield, and a kick
+        // that reaches them crosses their plane at this fraction of its flight.
         let postX = Double(dir > 0 ? AppleIIGraphicsEngine.goalPostRightX : AppleIIGraphicsEngine.goalPostLeftX)
         let postYard = (postX - fieldStartX) / pxPerYard
+        let goalPlaneFraction = 0.93
 
         // 1. Draw the static backdrop once, then snapshot it. Every frame starts from this
         //    snapshot, so nothing the ball passes over (yard lines, scrimmage line, end
         //    zones, uprights) is ever smeared or erased.
+        //    The kick view is a backdrop only: no ball carrier (this is not a scrimmage
+        //    play) and no first-down marker (yardsToGain 0), so the scrimmage line reads
+        //    in its own blue instead of the marker's yellow.
         drawField(yardLine: startYardLine, down: 4, yardsToGain: 0,
-                  possessingTeam: dir > 0 ? 0 : 1, offensiveOffset: 0)
+                  possessingTeam: dir > 0 ? 0 : 1, offensiveOffset: 0,
+                  showBallCarrier: false)
         let backdrop = pixelBuffer
 
-        // 2. Decide the kick up front (distance, hang time, peak height, sideways drift),
-        //    then derive the whole trajectory from those numbers.
-        let flightYards: Double          // ground distance of the first flight, in yards
+        // 2. Turn the supplied result into a flight: distance, hang time, apex, drift.
+        let flightYards: Double          // ground distance in the air, in yards
         let flightTime: Double           // seconds in the air
         let peakHeight: Double           // apex height in pixels
         let lateralDrift: Double         // total sideways drift over the flight, in pixels
-        let bounceYards: Double          // extra ground covered by one small hop after landing
-        var planeFraction: Double? = nil // fraction of flight at which the goal plane is crossed
+        let hopYards: Double             // short roll after the ball comes down, in yards
 
-        if isFieldGoal {
+        /// Where a punt or kickoff comes down: the reported spot, or inside the end zone for
+        /// a touchback (the game spots the ball on the receiving team's 20 afterwards).
+        func landingSpot(_ spotYardLine: Int, touchback: Bool) -> Double {
+            guard touchback else { return Double(spotYardLine) }
+            return Double(dir > 0 ? 100 : 0) + dirD * Double.random(in: 5...12)
+        }
+
+        switch outcome {
+        case .fieldGoal(let result):
             let dist = max(5.0, abs(postYard - Double(startYardLine)))   // yards to the posts
-            let effective = dist + 3.0   // dist already includes the end zone; add the holder's 7 yds, less rounding
-            let makeChance = min(0.97, max(0.2, 1.0 - max(0.0, effective - 30.0) * 0.0125))
-            let planeFrac = 0.93         // a kick that reaches the posts crosses them at 93% of flight
             peakHeight = Double.random(in: 16...20)
             flightTime = 1.1 + dist * 0.012
-            bounceYards = 0
-
-            if Double.random(in: 0..<1) < makeChance {
-                // Through the uprights
-                flightYards = dist / planeFrac
-                let target = Double.random(in: -(halfGap - 2.5)...(halfGap - 2.5))
-                lateralDrift = target / planeFrac
-            } else if Bool.random() {
-                // Wide left / wide right
-                flightYards = dist / planeFrac
-                let side: Double = Bool.random() ? 1 : -1
-                let target = side * Double.random(in: (halfGap + 2.0)...(halfGap + 7.0))
-                lateralDrift = target / planeFrac
-            } else {
-                // Short: lands before reaching the posts
+            hopYards = 0
+            switch result {
+            case .good:
+                // Through the uprights: cross the posts inside the gap.
+                flightYards = dist / goalPlaneFraction
+                lateralDrift = Double.random(in: -(halfGap - 2.5)...(halfGap - 2.5)) / goalPlaneFraction
+            case .wideLeft, .wideRight:
+                // Past the outside of an upright.
+                flightYards = dist / goalPlaneFraction
+                let side: Double = result == .wideLeft ? -1 : 1
+                lateralDrift = side * Double.random(in: (halfGap + 2.0)...(halfGap + 7.0)) / goalPlaneFraction
+            case .short:
+                // Comes down before it ever reaches the posts.
                 flightYards = dist * Double.random(in: 0.78...0.94)
                 lateralDrift = Double.random(in: -3...3)
             }
-            if flightYards >= dist { planeFraction = dist / flightYards }
-        } else if isKickoff {
-            flightYards = Double.random(in: 60...72)
-            flightTime = Double.random(in: 2.2...2.6)
-            peakHeight = Double.random(in: 21...25)
-            lateralDrift = Double.random(in: -3...3)
-            bounceYards = Double.random(in: 2...5)
-        } else {
-            flightYards = Double.random(in: 36...52)
+
+        case .punt(let spotYardLine, let isTouchback):
+            let distance = max(1.0, abs(landingSpot(spotYardLine, touchback: isTouchback) - Double(startYardLine)))
+            hopYards = min(Double.random(in: 1...4), max(0.0, distance - 1.0))
+            flightYards = distance - hopYards
             flightTime = 1.4 + flightYards * 0.017
             peakHeight = Double.random(in: 17...21)
             lateralDrift = Double.random(in: -4...4)
-            bounceYards = Double.random(in: 1...4)
+
+        case .kickoff(let spotYardLine, let isTouchback):
+            let distance = max(1.0, abs(landingSpot(spotYardLine, touchback: isTouchback) - Double(startYardLine)))
+            hopYards = min(Double.random(in: 2...5), max(0.0, distance - 1.0))
+            flightYards = distance - hopYards
+            flightTime = 2.2 + flightYards * 0.005
+            peakHeight = Double.random(in: 21...25)
+            lateralDrift = Double.random(in: -3...3)
         }
 
-        let startX = fieldStartX + Double(startYardLine) * pxPerYard
-        let hasBounce = bounceYards > 0
-        let bounceTime = 0.4
-        let bounceHeight = hasBounce ? peakHeight * 0.2 : 0.0
-        let totalTime = flightTime + (hasBounce ? bounceTime : 0.0)
+        let hasHop = hopYards > 0
+        let hopTime = 0.4
+        let hopHeight = hasHop ? peakHeight * 0.2 : 0.0
+        let totalTime = flightTime + (hasHop ? hopTime : 0.0)
 
         /// Ball state at `elapsed` seconds: ground X, ground lateral (Y), and height above ground.
         /// Ground track is a straight line (constant speed); height is a true parabola that
-        /// returns to exactly 0 at touchdown.
+        /// returns to exactly 0 when the ball comes down, then a smaller hop.
         func state(at elapsed: Double) -> (gx: Double, lat: Double, h: Double) {
             if elapsed < flightTime {
                 let s = elapsed / flightTime
@@ -449,46 +549,28 @@ class AppleIIGraphicsEngine: ObservableObject {
                         centerLat + lateralDrift * s,
                         4.0 * peakHeight * s * (1.0 - s))
             }
-            let s = hasBounce ? min(1.0, (elapsed - flightTime) / bounceTime) : 1.0
-            return (startX + dirD * (flightYards + bounceYards * s) * pxPerYard,
+            let s = hasHop ? min(1.0, (elapsed - flightTime) / hopTime) : 1.0
+            return (startX + dirD * (flightYards + hopYards * s) * pxPerYard,
                     centerLat + lateralDrift,
-                    4.0 * bounceHeight * s * (1.0 - s))
+                    4.0 * hopHeight * s * (1.0 - s))
         }
 
-        // 3. Work out the result from the trajectory itself.
-        let landingYard = Double(startYardLine) + dirD * (flightYards + bounceYards)
-        var isGood = false
-        let finalYard: Int
-
-        if isFieldGoal {
-            // Judge the kick at the goal-post plane: it must be between the uprights
-            // and above the crossbar at the moment it crosses.
-            if let pf = planeFraction {
-                let st = state(at: pf * flightTime)
-                isGood = abs(st.lat - centerLat) <= (halfGap - 0.5) && st.h >= crossbarClearance
-            }
-            finalYard = Int(max(0.0, min(100.0, landingYard.rounded())))
-        } else if landingYard > 100.0 || landingYard < 0.0 {
-            finalYard = dir > 0 ? 80 : 20          // touchback
-        } else {
-            finalYard = Int(landingYard.rounded())
-        }
-
-        // 4. Animate on the real clock so the speed doesn't depend on frame timing.
+        // 3. Play it on the real clock so the speed doesn't depend on frame timing.
         let startNanos = DispatchTime.now().uptimeNanoseconds
         while true {
+            guard isCurrent(generation) else { return false }
             let seconds = Double(DispatchTime.now().uptimeNanoseconds - startNanos) / 1_000_000_000.0
             let elapsed = min(seconds, totalTime)
             let st = state(at: elapsed)
             renderKickFrame(backdrop: backdrop, gx: st.gx, lat: st.lat, height: st.h)
-            if elapsed >= totalTime || Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 33_000_000)
+            commitFrame()
+            if elapsed >= totalTime { break }
+            guard await pause(nanoseconds: 33_000_000) else { return false }
         }
 
         // Leave the ball sitting where it came to rest for a moment.
-        try? await Task.sleep(nanoseconds: 450_000_000)
-
-        onComplete(isGood, finalYard)
+        guard await pause(nanoseconds: 450_000_000), isCurrent(generation) else { return false }
+        return true
     }
 
     /// Draws one kick frame: backdrop, then the ground shadow, then the ball lifted by `height`.
@@ -514,8 +596,6 @@ class AppleIIGraphicsEngine: ObservableObject {
                 setPixel(x: sx + dx, y: ballY + dy, color: 8)
             }
         }
-
-        presentFrame()
     }
 
     /// Bakes a goal post standing at the back of an end zone, drawn with a slight oblique
@@ -576,13 +656,25 @@ class AppleIIGraphicsEngine: ObservableObject {
 
     // MARK: - Native Fast Field Rendering
 
-    func drawField(yardLine: Int = 20, down: Int = 1, yardsToGain: Int = 10, possessingTeam: Int = 0, offensiveOffset: Int = -3) {
+    /// Draws the field for the current down and spot.
+    /// - Parameter offensiveOffset: Ball carrier offset from the scrimmage line, in yards
+    ///   (negative = behind the line). Converted to pixels at the field's own scale.
+    /// - Parameter showBallCarrier: pass false for backdrops that are not a scrimmage snap
+    ///   (the kick animations), so no stray carrier marker is painted onto the field.
+    func drawField(
+        yardLine: Int = 20,
+        down: Int = 1,
+        yardsToGain: Int = 10,
+        possessingTeam: Int = 0,
+        offensiveOffset: Double = -3,
+        showBallCarrier: Bool = true
+    ) {
         let width = AppleIIGraphicsEngine.width
         let height = AppleIIGraphicsEngine.height
         let marginTop = 8
         let marginBottom = 88
         let fieldStartX = 24
-        let fieldWidthPixels = 112.0
+        let fieldWidthPixels = AppleIIGraphicsEngine.fieldWidthPixels
         
         pixelBuffer.withUnsafeMutableBufferPointer { ptr in
             guard let buf = ptr.baseAddress else { return }
@@ -593,21 +685,24 @@ class AppleIIGraphicsEngine: ObservableObject {
                 memcpy(buf, staticBuf, AppleIIGraphicsEngine.totalPixels)
             }
             
-            // 2. Line of Scrimmage & Target Line
+            // 2. First-down marker, then the line of scrimmage. Draw order matters: when
+            //    yardsToGain is 0 both lines land on the same column, and the blue LOS has
+            //    to win over the yellow marker rather than the other way around.
             let ballX = fieldStartX + Int((Double(yardLine) / 100.0) * fieldWidthPixels)
             let targetYard = possessingTeam == 0 ? min(100, yardLine + yardsToGain) : max(0, yardLine - yardsToGain)
             let targetX = fieldStartX + Int((Double(targetYard) / 100.0) * fieldWidthPixels)
             
             for y in marginTop..<marginBottom {
                 let rowOffset = y * width
-                buf[rowOffset + ballX] = 2   // Blue Line of Scrimmage
                 buf[rowOffset + targetX] = 13 // Yellow 1st Down Marker
+                buf[rowOffset + ballX] = 2    // Blue Line of Scrimmage
             }
             
             // 3. Ball Carrier Marker (2x2)
+            guard showBallCarrier else { return }
             let direction = possessingTeam == 0 ? 1 : -1
-            let scaledOffset = offensiveOffset * 2
-            let currentOffenseX = ballX + (scaledOffset * direction)
+            let offsetPixels = Int((offensiveOffset * AppleIIGraphicsEngine.pxPerYard).rounded())
+            let currentOffenseX = ballX + (offsetPixels * direction)
             let carrierY = height / 2
             
             for dy in 0..<2 {
@@ -620,7 +715,5 @@ class AppleIIGraphicsEngine: ObservableObject {
                 }
             }
         }
-        
-        updateFrameImage()
     }
 }

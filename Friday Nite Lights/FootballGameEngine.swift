@@ -332,8 +332,8 @@ final class FootballGameEngine: ObservableObject {
         finalSummaryLines = []
         
         Task { @MainActor in
-            await graphicsEngine.playStartupAnimation {
-            }
+            // A cancelled or superseded intro must not continue the sequence.
+            guard await graphicsEngine.playStartupAnimation() else { return }
 
             appendLog("****************************************")
 
@@ -415,7 +415,9 @@ final class FootballGameEngine: ObservableObject {
         }
     }
     
-    func updateFieldGraphics(offensiveOffset: Int = 0) {
+    /// - Parameter offensiveOffset: ball carrier offset from the scrimmage line, in yards.
+    ///   Fractional values are kept so a short gain still moves the carrier smoothly.
+    func updateFieldGraphics(offensiveOffset: Double = 0) {
         graphicsEngine.drawField(
             yardLine: yardLine,
             down: down,
@@ -423,6 +425,7 @@ final class FootballGameEngine: ObservableObject {
             possessingTeam: possessingTeam,
             offensiveOffset: offensiveOffset
         )
+        graphicsEngine.commitFrame()
     }
     
     // MARK: - Play Selection & Animation
@@ -542,7 +545,6 @@ final class FootballGameEngine: ObservableObject {
     
     func animatePlayMovement(yards: Int, completion: @escaping () -> Void) {
         let totalFrames = 10
-        let stepYard = yards / totalFrames
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -554,8 +556,12 @@ final class FootballGameEngine: ObservableObject {
                 try? await Task.sleep(nanoseconds: 33_000_000)
 
                 self.soundEngine.playStep()
+                // Interpolate in yards, not whole-yard steps: integer division here used to
+                // hand every gain of 1-9 yards a step of 0 (so the carrier never moved) and
+                // silently dropped the remainder of longer gains.
+                let progress = Double(frame) / Double(totalFrames)
                 self.updateFieldGraphics(
-                    offensiveOffset: frame * stepYard
+                    offensiveOffset: Double(yards) * progress
                 )
             }
 
@@ -796,67 +802,93 @@ final class FootballGameEngine: ObservableObject {
 
         let kickingTeam = possessingTeam
         let direction = kickingTeam == 0 ? 1 : -1
-        
+        // Where the ball comes down is a game decision, so it is made before anything is
+        // drawn; the graphics engine only animates the flight to that spot.
+        let outcome = puntOutcome(direction: direction)
+
         appendLog("\(teams[kickingTeam]) PUNTS THE BALL...")
         soundEngine.playWhistle()
-        
+
         gamePhase = .animatingPlay
-        
+
         Task { @MainActor [weak self] in
             guard let self else { return }
 
             await self.waitForLogIdle()
 
-            await self.graphicsEngine.playKickAnimation(
+            guard await self.graphicsEngine.playKick(
+                outcome,
                 startYardLine: self.yardLine,
-                isFieldGoal: false,
                 direction: direction
-            ) { isGood, finalYard in
-                
-                self.advanceClock(seconds: 12)
-                
-                // Change possession before formatting the receiving team's spot.
-                self.possessingTeam = (kickingTeam == 0) ? 1 : 0
-                let returner = self.rosters[self.possessingTeam].wr
-                let isTouchback = finalYard >= 100 || finalYard <= 0
-                let puntDistance = abs(finalYard - self.yardLine)
+            ) else { return }
 
-                if isTouchback {
-                    self.yardLine = (self.possessingTeam == 0) ? 20 : 80
-                    self.appendLog("\(self.teams[kickingTeam])'S PUNT GOES INTO")
-                    self.appendLog("THE ENDZONE FOR A TOUCHBACK")
-                    self.appendLog("\(self.teams[self.possessingTeam]) TAKE OVER AT THE \(self.formattedYardLine).")
+            self.advanceClock(seconds: 12)
+
+            // Change possession before formatting the receiving team's spot.
+            self.possessingTeam = (kickingTeam == 0) ? 1 : 0
+            let returner = self.rosters[self.possessingTeam].wr
+            let finalYard = outcome.spotYardLine ?? self.yardLine
+            let puntDistance = abs(finalYard - self.yardLine)
+
+            if outcome.isTouchback {
+                self.yardLine = finalYard
+                self.appendLog("\(self.teams[kickingTeam])'S PUNT GOES INTO")
+                self.appendLog("THE ENDZONE FOR A TOUCHBACK")
+                self.appendLog("\(self.teams[self.possessingTeam]) TAKE OVER AT THE \(self.formattedYardLine).")
+            } else {
+                self.yardLine = max(1, min(99, finalYard))
+
+                if puntDistance < 15 {
+                    self.appendLog("\(self.teams[kickingTeam]) BLOWS THE PUNT!!!")
+                    self.appendLog("\(self.teams[self.possessingTeam]) BALL \(self.formattedYardLine).")
+                } else if Double.random(in: 0...1) < 0.45 {
+                    self.appendLog("\(returner) CALLS FOR A FAIR CATCH")
+                    self.appendLog("AT THE \(self.formattedYardLine). \(self.teams[self.possessingTeam]) TAKE OVER.")
+                } else if Double.random(in: 0...1) < 0.25 {
+                    self.appendLog("\(returner) LETS IT BOUNCE...")
+                    // Simulate a short uncontrolled bounce toward the receiving
+                    // team's end zone, without allowing the ball to enter it.
+                    let bounce = Int.random(in: 1...4)
+                    let directionToReceivingGoal = self.possessingTeam == 0 ? 1 : -1
+                    self.yardLine = max(1, min(99, self.yardLine + bounce * directionToReceivingGoal))
+                    self.appendLog("BALL BOUNCES TO THE \(self.formattedYardLine).")
                 } else {
-                    self.yardLine = max(1, min(99, finalYard))
-
-                    if puntDistance < 15 {
-                        self.appendLog("\(self.teams[kickingTeam]) BLOWS THE PUNT!!!")
-                        self.appendLog("\(self.teams[self.possessingTeam]) BALL \(self.formattedYardLine).")
-                    } else if Double.random(in: 0...1) < 0.45 {
-                        self.appendLog("\(returner) CALLS FOR A FAIR CATCH")
-                        self.appendLog("AT THE \(self.formattedYardLine). \(self.teams[self.possessingTeam]) TAKE OVER.")
-                    } else if Double.random(in: 0...1) < 0.25 {
-                        self.appendLog("\(returner) LETS IT BOUNCE...")
-                        // Simulate a short uncontrolled bounce toward the receiving
-                        // team's end zone, without allowing the ball to enter it.
-                        let bounce = Int.random(in: 1...4)
-                        let directionToReceivingGoal = self.possessingTeam == 0 ? 1 : -1
-                        self.yardLine = max(1, min(99, self.yardLine + bounce * directionToReceivingGoal))
-                        self.appendLog("BALL BOUNCES TO THE \(self.formattedYardLine).")
-                    } else {
-                        self.appendLog("\(self.teams[kickingTeam])'S PUNT TRAVELED TO THE \(self.formattedYardLine).")
-                        self.appendLog("\(self.teams[self.possessingTeam]) TAKE OVER.")
-                    }
+                    self.appendLog("\(self.teams[kickingTeam])'S PUNT TRAVELED TO THE \(self.formattedYardLine).")
+                    self.appendLog("\(self.teams[self.possessingTeam]) TAKE OVER.")
                 }
-
-                self.down = 1
-                self.yardsToGain = 10
-                self.returnToPlaySelectionIfNeeded()
             }
+
+            self.down = 1
+            self.yardsToGain = 10
+            self.returnToPlaySelectionIfNeeded()
         }
     }
-    
-    
+
+    /// Punt distance and landing spot. Decided here, before the animation, because where the
+    /// ball comes down and who takes over are game facts rather than drawing details. A punt
+    /// that lands in the end zone is a touchback, spotted on the receiving team's 20.
+    private func puntOutcome(direction: Int) -> KickOutcome {
+        let carry = Double.random(in: 36...52) + Double.random(in: 1...4)   // flight plus roll
+        let landing = Double(yardLine) + Double(direction) * carry
+        if landing > 100 || landing < 0 {
+            return .punt(spotYardLine: direction > 0 ? 80 : 20, isTouchback: true)
+        }
+        return .punt(spotYardLine: max(1, min(99, Int(landing.rounded()))), isTouchback: false)
+    }
+
+    /// Field goal result. The make chance falls off with the distance that is announced to
+    /// the player, and a miss is either wide (past an upright) or short (never gets there).
+    private func fieldGoalOutcome(distanceYards: Int) -> KickOutcome {
+        let makeChance = min(0.97, max(0.2, 1.0 - max(0.0, Double(distanceYards) - 30.0) * 0.0125))
+        if Double.random(in: 0..<1) < makeChance {
+            return .fieldGoal(.good)
+        }
+        if Bool.random() {
+            return .fieldGoal(Bool.random() ? .wideLeft : .wideRight)
+        }
+        return .fieldGoal(.short)
+    }
+
     func executeFieldGoal() {
         // Special-Teams block check first
         if attemptSpecialTeamsBlock(isFieldGoal: true) {
@@ -866,37 +898,38 @@ final class FootballGameEngine: ObservableObject {
 
         let direction = possessingTeam == 0 ? 1 : -1
         let fieldGoalDistance = (possessingTeam == 0) ? (100 - yardLine + 17) : (yardLine + 17)
-        
+        // The kick is resolved before it is drawn; the graphics engine only animates it.
+        let outcome = fieldGoalOutcome(distanceYards: fieldGoalDistance)
+
         appendLog("\(teams[possessingTeam]) ATTEMPTS A \(fieldGoalDistance)-YARD FIELD GOAL...")
         soundEngine.playWhistle()
-        
+
         gamePhase = .animatingPlay
-        
+
         Task { @MainActor [weak self] in
             guard let self else { return }
 
             await self.waitForLogIdle()
 
-            await self.graphicsEngine.playKickAnimation(
+            guard await self.graphicsEngine.playKick(
+                outcome,
                 startYardLine: self.yardLine,
-                isFieldGoal: true,
                 direction: direction
-            ) { isGood, finalYard in
-                
-                self.advanceClock(seconds: 8)
-                
-                if isGood {
-                    let kicker = self.possessingTeam
-                    self.appendLog("FIELD GOAL IS GOOD! (+3 PTS)")
-                    self.afterLog {
-                        self.scores[kicker] += 3
-                        self.soundEngine.playTouchdownFanfare()
-                    }
-                    self.resetAfterScore()
-                } else {
-                    self.appendLog("FIELD GOAL MISSED!")
-                    self.executeTurnover()
+            ) else { return }
+
+            self.advanceClock(seconds: 8)
+
+            if outcome == .fieldGoal(.good) {
+                let kicker = self.possessingTeam
+                self.appendLog("FIELD GOAL IS GOOD! (+3 PTS)")
+                self.afterLog {
+                    self.scores[kicker] += 3
+                    self.soundEngine.playTouchdownFanfare()
                 }
+                self.resetAfterScore()
+            } else {
+                self.appendLog("FIELD GOAL MISSED!")
+                self.executeTurnover()
             }
         }
     }
